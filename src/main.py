@@ -1,38 +1,36 @@
-from src.interfaces.agent import Agent
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
-from typing import Optional
+from src.interfaces.llm import LLM
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from typing import Optional, Any
 from huggingface_hub import login
 from dotenv import load_dotenv
-from jinja2 import Template
 import os
 import torch
+import gc
 
-class Chatbot(Agent):
+class Chatbot(LLM):
     def __init__(self,
                  model: str,
                  system_message: str,
                  device,
+                 quant_config: Optional[Any] = None,
                  ):
         super().__init__(model, device)
+        self.quant_config = quant_config
         self.history = [
             {
                 "role": "system",
                 "content": system_message
             }
         ]
-        self.model = AutoModelForCausalLM.from_pretrained(model)
+        self.model = AutoModelForCausalLM.from_pretrained(model, 
+                                                          torch_dtype="auto",
+                                                          quantization_config=self.quant_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         self.pipe = pipeline(
             task="text-generation",
             model=self.model,
             tokenizer=self.tokenizer,
-            device=device
         )
-        
-    def format_conversation(self, template_str, messages, bos_token, eos_token):
-        template = Template(template_str)
-        
-        return template.render(messages=messages, bos_token=bos_token, eos_token=eos_token)
 
     def invoke(self, query):
         structured_query = {
@@ -41,6 +39,8 @@ class Chatbot(Agent):
         }
 
         self.history.append(structured_query)
+        
+        self.pipe.model.to(self.device)
         
         outputs = self.pipe(
             self.history,
@@ -56,21 +56,38 @@ class Chatbot(Agent):
 
 
 if __name__ == '__main__':
-
+    # Load the API key from .env file
     load_dotenv()
     login(token=os.getenv("HUGGINGFACE_API_KEY"))
 
+    # Clear memory
+    gc.collect()    
+    torch.cuda.empty_cache()
+
+    # Define quantization configuration
+    double_quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    # Setting up hyperparams
     SYSTEM_MESSAGE = "You are a chatbot, you're tasked with assisting users in their queries. Be precise, helpful and nice."
-    MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+    MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
     
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # Initialize chatbot
     chatbot = Chatbot(
         model=MODEL_ID,
         system_message=SYSTEM_MESSAGE,
         device=device,
+        quant_config=double_quant_config
     )
     
+    # Start chat
     while True:
         query = input("You: ")
         if query == "exit":
